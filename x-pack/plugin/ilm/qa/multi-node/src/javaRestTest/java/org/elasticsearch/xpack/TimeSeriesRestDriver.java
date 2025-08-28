@@ -47,7 +47,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS;
 import static org.elasticsearch.test.ESTestCase.randomAlphaOfLengthBetween;
@@ -378,16 +377,7 @@ public final class TimeSeriesRestDriver {
             response.getEntity().getContent(),
             false
         );
-        if (logger.isTraceEnabled()) {
-            logger.trace(
-                "segments response for {}: {}",
-                index,
-                originalResponseEntity.keySet()
-                    .stream()
-                    .map(key -> key + "=" + originalResponseEntity.get(key))
-                    .collect(Collectors.joining(", ", "{", "}"))
-            );
-        }
+        logger.trace("segments response for {}: {}", index, originalResponseEntity);
         Map<String, Object> responseEntity = (Map<String, Object>) originalResponseEntity.get("indices");
         responseEntity = (Map<String, Object>) responseEntity.get(index);
         responseEntity = (Map<String, Object>) responseEntity.get("shards");

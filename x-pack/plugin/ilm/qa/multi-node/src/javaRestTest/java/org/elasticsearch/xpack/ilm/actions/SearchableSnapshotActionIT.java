@@ -21,6 +21,7 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.test.rest.ESRestTestCase;
+import org.elasticsearch.test.rest.ObjectPath;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentType;
 import org.elasticsearch.xpack.core.ilm.AllocateAction;
@@ -61,10 +62,13 @@ import static org.elasticsearch.xpack.TimeSeriesRestDriver.getStepKeyForIndex;
 import static org.elasticsearch.xpack.TimeSeriesRestDriver.indexDocument;
 import static org.elasticsearch.xpack.TimeSeriesRestDriver.rolloverMaxOneDocCondition;
 import static org.elasticsearch.xpack.core.ilm.DeleteAction.WITH_SNAPSHOT_DELETE;
+import static org.elasticsearch.xpack.core.ilm.SearchableSnapshotAction.FORCE_MERGE_INDEX_PREFIX;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.startsWith;
 
 public class SearchableSnapshotActionIT extends ESRestTestCase {
 
@@ -106,32 +110,49 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         assertThat(backingIndices.size(), equalTo(2));
         String backingIndexName = backingIndices.getFirst();
         String restoredIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + backingIndexName;
-        assertTrue(waitUntil(() -> {
-            try {
-                return indexExists(restoredIndexName);
-            } catch (IOException e) {
-                return false;
-            }
-        }, 30, TimeUnit.SECONDS));
+        awaitIndexExists(restoredIndexName);
 
         assertBusy(
             () -> { assertThat(explainIndex(client(), restoredIndexName).get("step"), is(PhaseCompleteStep.NAME)); },
             30,
             TimeUnit.SECONDS
         );
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(backingIndexName);
     }
 
-    public void testSearchableSnapshotForceMergesIndexToOneSegment() throws Exception {
+    /**
+     * Test that when we have a searchable snapshot action with force merge enabled and the source index has _at least one_ replica,
+     * we perform the force merge on _the cloned index_ with 0 replicas and then snapshot the clone.
+     */
+    public void testSearchableSnapshotForceMergesIndexToOneSegmentOnClonedIndex() throws Exception {
+        testSearchableSnapshotForceMergesIndexToOneSegment(true);
+    }
+
+    /**
+     * Test that when we have a searchable snapshot action with force merge enabled and the source index has _zero_ replicas,
+     * we perform the force merge on the _source_ index and snapshot the source index.
+     */
+    public void testSearchableSnapshotForceMergesIndexToOneSegmentOnSourceIndex() throws Exception {
+        testSearchableSnapshotForceMergesIndexToOneSegment(false);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void testSearchableSnapshotForceMergesIndexToOneSegment(boolean withReplicas) throws Exception {
         createSnapshotRepo(client(), snapshotRepo, randomBoolean());
         createNewSingletonPolicy(client(), policy, "cold", new SearchableSnapshotAction(snapshotRepo, true));
 
+        // The test suite runs with 4 nodes, so we can have up to 3 replicas.
+        final int numberOfReplicas = withReplicas ? randomIntBetween(1, 3) : 0;
         createComposableTemplate(
             client(),
             randomAlphaOfLengthBetween(5, 10).toLowerCase(Locale.ROOT),
             dataStream,
-            new Template(null, null, null)
+            new Template(Settings.builder().put(INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), numberOfReplicas).build(), null, null)
         );
 
+        // We index some documents and refresh in between to ensure we have multiple segments. Note that this is based on the premise
+        // that data streams have 1 primary shard by default.
         for (int i = 0; i < randomIntBetween(5, 10); i++) {
             indexDocument(client(), dataStream, true);
         }
@@ -143,46 +164,44 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
 
         // rolling over the data stream so we can apply the searchable snapshot policy to a backing index that's not the write index
         rolloverMaxOneDocCondition(client(), dataStream);
+        // Wait for all shards to be allocated.
+        ensureGreen(dataStream);
 
         updateIndexSettings(dataStream, Settings.builder().put(LifecycleSettings.LIFECYCLE_NAME, policy));
-        assertTrue(waitUntil(() -> {
-            try {
-                Integer numberOfSegments = getNumberOfPrimarySegments(client(), backingIndexName);
-                logger.info("index {} has {} segments", backingIndexName, numberOfSegments);
-                // this is a loose assertion here as forcemerge is best effort
-                if (preLifecycleBackingIndexSegments > 1) {
-                    return numberOfSegments < preLifecycleBackingIndexSegments;
-                } else {
-                    // the index had only one segement to start with so nothing to assert
-                    return true;
-                }
-            } catch (Exception e) {
-                try {
-                    // if ILM executed the action already we don't have an index to assert on so we don't fail the test
-                    return indexExists(backingIndexName) == false;
-                } catch (IOException ex) {
-                    return false;
-                }
-            }
-        }, 60, TimeUnit.SECONDS));
 
         String restoredIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + backingIndexName;
-        assertTrue(waitUntil(() -> {
-            try {
-                return indexExists(restoredIndexName);
-            } catch (IOException e) {
-                return false;
-            }
-        }, 60, TimeUnit.SECONDS));
+        awaitIndexExists(restoredIndexName);
 
         assertBusy(
             () -> { assertThat(explainIndex(client(), restoredIndexName).get("step"), is(PhaseCompleteStep.NAME)); },
             30,
             TimeUnit.SECONDS
         );
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(backingIndexName);
+        // Regardless of whether we force merged the backing index or a clone, the cloned index should not exist (anymore).
+        awaitIndexDoesNotExist(FORCE_MERGE_INDEX_PREFIX + "-*-" + backingIndexName);
+
+        Integer numberOfPrimarySegments = getNumberOfPrimarySegments(client(), restoredIndexName);
+        assertThat(numberOfPrimarySegments, equalTo(1));
+
+        // Since data streams have 1 replica by default, we should perform the force merge on a clone with 0 replicas.
+        // We can't assert the replicas of the mounted snapshot as it's created with 0 replicas by default, but we can at least assert
+        // that the mounted snapshot was taken from the _cloned_ force merge index.
+        List<Map<String, Object>> snapshots = getSnapshots();
+        assertThat("expected to have only one snapshot, but got: " + snapshots, snapshots.size(), equalTo(1));
+        Map<String, Object> snapshot = snapshots.getFirst();
+        var indices = (List<String>) snapshot.get("indices");
+        assertThat("expected to have only one index, but got: " + indices, indices.size(), equalTo(1));
+        String snapshotIndexName = indices.getFirst();
+        if (withReplicas) {
+            assertThat("expected index to start with the force merge prefix", snapshotIndexName, startsWith(FORCE_MERGE_INDEX_PREFIX));
+            assertThat("expected index to end with the backing index name", snapshotIndexName, endsWith(backingIndexName));
+        } else {
+            assertThat("expected index to be the backing index name", snapshotIndexName, equalTo(backingIndexName));
+        }
     }
 
-    @SuppressWarnings("unchecked")
     public void testDeleteActionDeletesSearchableSnapshot() throws Exception {
         createSnapshotRepo(client(), snapshotRepo, randomBoolean());
 
@@ -218,25 +237,17 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         String restoredIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + backingIndexName;
 
         // let's wait for ILM to finish
-        assertBusy(() -> assertFalse(indexExists(backingIndexName)), 60, TimeUnit.SECONDS);
-        assertBusy(() -> assertFalse(indexExists(restoredIndexName)), 60, TimeUnit.SECONDS);
+        awaitIndexDoesNotExist(backingIndexName);
+        awaitIndexDoesNotExist(restoredIndexName);
 
-        assertTrue("the snapshot we generate in the cold phase should be deleted by the delete phase", waitUntil(() -> {
-            try {
-                Request getSnapshotsRequest = new Request("GET", "_snapshot/" + snapshotRepo + "/_all");
-                Response getSnapshotsResponse = client().performRequest(getSnapshotsRequest);
-
-                Map<String, Object> responseMap;
-                try (InputStream is = getSnapshotsResponse.getEntity().getContent()) {
-                    responseMap = XContentHelper.convertToMap(XContentType.JSON.xContent(), is, true);
-                }
-                Object snapshots = responseMap.get("snapshots");
-                return ((List<Map<String, Object>>) snapshots).size() == 0;
-            } catch (Exception e) {
-                logger.error(e.getMessage(), e);
-                return false;
-            }
-        }, 30, TimeUnit.SECONDS));
+        assertBusy(() -> {
+            List<Map<String, Object>> snapshots = getSnapshots();
+            assertThat(
+                "the snapshot we generate in the cold phase should be deleted by the delete phase, but got snapshot: " + snapshots,
+                snapshots.size(),
+                equalTo(0)
+            );
+        });
     }
 
     public void testCreateInvalidPolicy() {
@@ -306,21 +317,17 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         // rolling over the data stream so we can apply the searchable snapshot policy to a backing index that's not the write index
         indexDocument(client(), dataStream, true);
 
-        var backingIndices = getDataStreamBackingIndexNames(dataStream);
-        String restoredIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + backingIndices.get(0);
-        assertTrue(waitUntil(() -> {
-            try {
-                return indexExists(restoredIndexName);
-            } catch (IOException e) {
-                return false;
-            }
-        }, 30, TimeUnit.SECONDS));
+        String backingIndexName = getDataStreamBackingIndexNames(dataStream).getFirst();
+        String restoredIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + backingIndexName;
+        awaitIndexExists(restoredIndexName);
 
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), restoredIndexName);
             assertThat(stepKeyForIndex.phase(), is("hot"));
             assertThat(stepKeyForIndex.name(), is(PhaseCompleteStep.NAME));
         }, 30, TimeUnit.SECONDS);
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(backingIndexName);
 
         createPolicy(
             client(),
@@ -385,19 +392,15 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
 
         String backingIndexName = getDataStreamBackingIndexNames(dataStream).getFirst();
         String searchableSnapMountedIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + backingIndexName;
-        assertTrue(waitUntil(() -> {
-            try {
-                return indexExists(searchableSnapMountedIndexName);
-            } catch (IOException e) {
-                return false;
-            }
-        }, 30, TimeUnit.SECONDS));
+        awaitIndexExists(searchableSnapMountedIndexName);
 
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), searchableSnapMountedIndexName);
             assertThat(stepKeyForIndex.phase(), is("hot"));
             assertThat(stepKeyForIndex.name(), is(PhaseCompleteStep.NAME));
-        }, 30, TimeUnit.SECONDS);
+        });
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(backingIndexName);
 
         // snapshot the data stream
         String dsSnapshotName = "snapshot_ds_" + dataStream;
@@ -456,7 +459,6 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         }, 30, TimeUnit.SECONDS);
     }
 
-    @SuppressWarnings("unchecked")
     public void testIdenticalSearchableSnapshotActionIsNoop() throws Exception {
         String index = "myindex-" + randomAlphaOfLength(4).toLowerCase(Locale.ROOT) + "-000001";
         createSnapshotRepo(client(), snapshotRepo, randomBoolean());
@@ -492,35 +494,25 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
 
         final String searchableSnapMountedIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + index;
 
-        assertBusy(() -> {
-            logger.info("--> waiting for [{}] to exist...", searchableSnapMountedIndexName);
-            assertTrue(indexExists(searchableSnapMountedIndexName));
-        }, 30, TimeUnit.SECONDS);
+        logger.info("--> waiting for [{}] to exist...", searchableSnapMountedIndexName);
+        awaitIndexExists(searchableSnapMountedIndexName);
 
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), searchableSnapMountedIndexName);
             assertThat(stepKeyForIndex.phase(), is("cold"));
             assertThat(stepKeyForIndex.name(), is(PhaseCompleteStep.NAME));
         }, 30, TimeUnit.SECONDS);
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(index);
 
-        Request getSnaps = new Request("GET", "/_snapshot/" + snapshotRepo + "/_all");
-        Response response = client().performRequest(getSnaps);
-        Map<String, Object> responseMap;
-        try (InputStream is = response.getEntity().getContent()) {
-            responseMap = XContentHelper.convertToMap(XContentType.JSON.xContent(), is, true);
-        }
-        assertThat(
-            "expected to have only one snapshot, but got: " + responseMap,
-            ((List<Map<String, Object>>) responseMap.get("snapshots")).size(),
-            equalTo(1)
-        );
+        List<Map<String, Object>> snapshots = getSnapshots();
+        assertThat("expected to have only one snapshot, but got: " + snapshots, snapshots.size(), equalTo(1));
 
         Request hitCount = new Request("GET", "/" + searchableSnapMountedIndexName + "/_count");
         Map<String, Object> count = entityAsMap(client().performRequest(hitCount));
         assertThat("expected a single document but got: " + count, (int) count.get("count"), equalTo(1));
     }
 
-    @SuppressWarnings("unchecked")
     public void testConvertingSearchableSnapshotFromFullToPartial() throws Exception {
         String index = "myindex-" + randomAlphaOfLength(4).toLowerCase(Locale.ROOT);
         createSnapshotRepo(client(), snapshotRepo, randomBoolean());
@@ -553,28 +545,19 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         final String searchableSnapMountedIndexName = SearchableSnapshotAction.PARTIAL_RESTORED_INDEX_PREFIX
             + SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + index;
 
-        assertBusy(() -> {
-            logger.info("--> waiting for [{}] to exist...", searchableSnapMountedIndexName);
-            assertTrue(indexExists(searchableSnapMountedIndexName));
-        }, 30, TimeUnit.SECONDS);
+        logger.info("--> waiting for [{}] to exist...", searchableSnapMountedIndexName);
+        awaitIndexExists(searchableSnapMountedIndexName);
 
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), searchableSnapMountedIndexName);
             assertThat(stepKeyForIndex.phase(), is("frozen"));
             assertThat(stepKeyForIndex.name(), is(PhaseCompleteStep.NAME));
         }, 30, TimeUnit.SECONDS);
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(index);
 
-        Request getSnaps = new Request("GET", "/_snapshot/" + snapshotRepo + "/_all");
-        Response response = client().performRequest(getSnaps);
-        Map<String, Object> responseMap;
-        try (InputStream is = response.getEntity().getContent()) {
-            responseMap = XContentHelper.convertToMap(XContentType.JSON.xContent(), is, true);
-        }
-        assertThat(
-            "expected to have only one snapshot, but got: " + responseMap,
-            ((List<Map<String, Object>>) responseMap.get("snapshots")).size(),
-            equalTo(1)
-        );
+        List<Map<String, Object>> snapshots = getSnapshots();
+        assertThat("expected to have only one snapshot, but got: " + snapshots, snapshots.size(), equalTo(1));
 
         Request hitCount = new Request("GET", "/" + searchableSnapMountedIndexName + "/_count");
         Map<String, Object> count = entityAsMap(client().performRequest(hitCount));
@@ -588,7 +571,6 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         );
     }
 
-    @SuppressWarnings("unchecked")
     public void testResumingSearchableSnapshotFromFullToPartial() throws Exception {
         String index = "myindex-" + randomAlphaOfLength(4).toLowerCase(Locale.ROOT);
         createSnapshotRepo(client(), snapshotRepo, randomBoolean());
@@ -634,17 +616,15 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         updateIndexSettings(index, Settings.builder().put(LifecycleSettings.LIFECYCLE_NAME, policyCold));
 
         final String fullMountedIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + index;
-
-        assertBusy(() -> {
-            logger.info("--> waiting for [{}] to exist...", fullMountedIndexName);
-            assertTrue(indexExists(fullMountedIndexName));
-        }, 30, TimeUnit.SECONDS);
+        logger.info("--> waiting for [{}] to exist...", fullMountedIndexName);
+        awaitIndexExists(fullMountedIndexName);
 
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), fullMountedIndexName);
             assertThat(stepKeyForIndex.phase(), is("cold"));
             assertThat(stepKeyForIndex.name(), is(PhaseCompleteStep.NAME));
         }, 30, TimeUnit.SECONDS);
+        awaitIndexDoesNotExist(index);
 
         // remove ILM
         {
@@ -654,11 +634,10 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         }
         // add cold-frozen
         updateIndexSettings(index, Settings.builder().put(LifecycleSettings.LIFECYCLE_NAME, policyFrozen));
+
         String partiallyMountedIndexName = SearchableSnapshotAction.PARTIAL_RESTORED_INDEX_PREFIX + fullMountedIndexName;
-        assertBusy(() -> {
-            logger.info("--> waiting for [{}] to exist...", partiallyMountedIndexName);
-            assertTrue(indexExists(partiallyMountedIndexName));
-        }, 30, TimeUnit.SECONDS);
+        logger.info("--> waiting for [{}] to exist...", partiallyMountedIndexName);
+        awaitIndexExists(partiallyMountedIndexName);
 
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), partiallyMountedIndexName);
@@ -689,13 +668,11 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         assertBusy(() -> {
             logger.info("--> waiting for [{}] to be deleted...", partiallyMountedIndexName);
             assertThat(indexExists(partiallyMountedIndexName), is(false));
-            Request getSnaps = new Request("GET", "/_snapshot/" + snapshotRepo + "/_all");
-            Map<String, Object> responseMap = responseAsMap(client().performRequest(getSnaps));
-            assertThat(((List<Map<String, Object>>) responseMap.get("snapshots")).size(), equalTo(1));
+            List<Map<String, Object>> snapshots = getSnapshots();
+            assertThat("expected to have only one snapshot, but got: " + snapshots, snapshots.size(), equalTo(1));
         }, 30, TimeUnit.SECONDS);
     }
 
-    @SuppressWarnings("unchecked")
     public void testResumingSearchableSnapshotFromPartialToFull() throws Exception {
         String index = "myindex-" + randomAlphaOfLength(4).toLowerCase(Locale.ROOT);
         createSnapshotRepo(client(), snapshotRepo, randomBoolean());
@@ -717,7 +694,6 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         createPolicy(
             client(),
             policyColdFrozen,
-
             null,
             null,
             new Phase(
@@ -744,10 +720,8 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         final String fullMountedIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + index;
         final String partialMountedIndexName = SearchableSnapshotAction.PARTIAL_RESTORED_INDEX_PREFIX + fullMountedIndexName;
 
-        assertBusy(() -> {
-            logger.info("--> waiting for [{}] to exist...", partialMountedIndexName);
-            assertTrue(indexExists(partialMountedIndexName));
-        }, 30, TimeUnit.SECONDS);
+        logger.info("--> waiting for [{}] to exist...", partialMountedIndexName);
+        awaitIndexExists(partialMountedIndexName);
 
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), partialMountedIndexName);
@@ -764,10 +738,8 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         // add a policy that will only include the fully mounted searchable snapshot
         updateIndexSettings(index, Settings.builder().put(LifecycleSettings.LIFECYCLE_NAME, policyCold));
         String restoredPartiallyMountedIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + partialMountedIndexName;
-        assertBusy(() -> {
-            logger.info("--> waiting for [{}] to exist...", restoredPartiallyMountedIndexName);
-            assertTrue(indexExists(restoredPartiallyMountedIndexName));
-        }, 30, TimeUnit.SECONDS);
+        logger.info("--> waiting for [{}] to exist...", restoredPartiallyMountedIndexName);
+        awaitIndexExists(restoredPartiallyMountedIndexName);
 
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), restoredPartiallyMountedIndexName);
@@ -794,9 +766,8 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         assertBusy(() -> {
             logger.info("--> waiting for [{}] to be deleted...", restoredPartiallyMountedIndexName);
             assertThat(indexExists(restoredPartiallyMountedIndexName), is(false));
-            Request getSnaps = new Request("GET", "/_snapshot/" + snapshotRepo + "/_all");
-            Map<String, Object> responseMap = responseAsMap(client().performRequest(getSnaps));
-            assertThat(((List<Map<String, Object>>) responseMap.get("snapshots")).size(), equalTo(1));
+            List<Map<String, Object>> snapshots = getSnapshots();
+            assertThat("expected to have only one snapshot, but got: " + snapshots, snapshots.size(), equalTo(1));
         }, 30, TimeUnit.SECONDS);
     }
 
@@ -875,10 +846,8 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         indexDocument(client(), dataStream, true);
 
         final String restoredIndex = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + firstGenIndex;
-        assertBusy(() -> {
-            logger.info("--> waiting for [{}] to exist...", restoredIndex);
-            assertTrue(indexExists(restoredIndex));
-        }, 30, TimeUnit.SECONDS);
+        logger.info("--> waiting for [{}] to exist...", restoredIndex);
+        awaitIndexExists(restoredIndex);
         assertBusy(
             () -> assertThat(getStepKeyForIndex(client(), restoredIndex), is(PhaseCompleteStep.finalStep("hot").getKey())),
             30,
@@ -888,6 +857,9 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         Map<String, Object> hotIndexSettings = getIndexSettingsAsMap(restoredIndex);
         // searchable snapshots mounted in the hot phase should be pinned to hot nodes
         assertThat(hotIndexSettings.get(DataTier.TIER_PREFERENCE), is("data_hot"));
+
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(firstGenIndex);
 
         assertOK(client().performRequest(new Request("DELETE", "_data_stream/" + dataStream)));
         assertOK(client().performRequest(new Request("DELETE", "_ilm/policy/" + policy)));
@@ -921,19 +893,15 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         assertThat(backingIndices.size(), equalTo(2));
         String backingIndexName = backingIndices.getFirst();
         String restoredIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + backingIndexName;
-        assertTrue(waitUntil(() -> {
-            try {
-                return indexExists(restoredIndexName);
-            } catch (IOException e) {
-                return false;
-            }
-        }, 30, TimeUnit.SECONDS));
+        awaitIndexExists(restoredIndexName);
 
         assertBusy(
             () -> { assertThat(explainIndex(client(), restoredIndexName).get("step"), is(PhaseCompleteStep.NAME)); },
             30,
             TimeUnit.SECONDS
         );
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(backingIndexName);
     }
 
     public void testSearchableSnapshotTotalShardsPerNode() throws Exception {
@@ -969,15 +937,15 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         // wait for snapshot successfully mounted and ILM execution completed
         final String searchableSnapMountedIndexName = SearchableSnapshotAction.PARTIAL_RESTORED_INDEX_PREFIX
             + SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + index;
-        assertBusy(() -> {
-            logger.info("--> waiting for [{}] to exist...", searchableSnapMountedIndexName);
-            assertTrue(indexExists(searchableSnapMountedIndexName));
-        }, 30, TimeUnit.SECONDS);
+        logger.info("--> waiting for [{}] to exist...", searchableSnapMountedIndexName);
+        awaitIndexExists(searchableSnapMountedIndexName);
         assertBusy(() -> {
             Step.StepKey stepKeyForIndex = getStepKeyForIndex(client(), searchableSnapMountedIndexName);
             assertThat(stepKeyForIndex.phase(), is("frozen"));
             assertThat(stepKeyForIndex.name(), is(PhaseCompleteStep.NAME));
         }, 30, TimeUnit.SECONDS);
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(index);
 
         // validate total_shards_per_node setting
         Map<String, Object> indexSettings = getIndexSettingsAsMap(searchableSnapMountedIndexName);
@@ -1027,13 +995,7 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         assertThat(backingIndices.size(), equalTo(2));
         String backingIndexName = backingIndices.getFirst();
         String restoredIndexName = SearchableSnapshotAction.FULL_RESTORED_INDEX_PREFIX + backingIndexName;
-        assertTrue(waitUntil(() -> {
-            try {
-                return indexExists(restoredIndexName);
-            } catch (IOException e) {
-                return false;
-            }
-        }, 30, TimeUnit.SECONDS));
+        awaitIndexExists(restoredIndexName);
 
         // check that the index is in the expected step and has the expected step_info.message
         assertBusy(() -> {
@@ -1053,6 +1015,8 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
             Integer numberOfReplicas = Integer.valueOf((String) indexSettings.get(INDEX_NUMBER_OF_REPLICAS_SETTING.getKey()));
             assertThat(numberOfReplicas, is(1));
         }
+        // Wait for the original index to be deleted, to ensure ILM has finished
+        awaitIndexDoesNotExist(backingIndexName);
 
         // tweak the policy to replicate_for hardly any time at all
         createPolicy(
@@ -1100,5 +1064,12 @@ public class SearchableSnapshotActionIT extends ESRestTestCase {
         String action = (String) indexResponse.get("action");
         String step = (String) indexResponse.get("step");
         return new Step.StepKey(phase, action, step);
+    }
+
+    private List<Map<String, Object>> getSnapshots() throws IOException {
+        Request getSnaps = new Request("GET", "/_snapshot/" + snapshotRepo + "/_all");
+        Response response = client().performRequest(getSnaps);
+        ObjectPath objectPath = ObjectPath.createFromResponse(response);
+        return objectPath.evaluate("snapshots");
     }
 }
